@@ -30,6 +30,7 @@ author: d. gauchard
 // esp(lwip1.4) side of glue for esp8266
 // - sdk-2.0.0(656edbf)
 // - sdk-2.1.0(116b762)
+// - sdk-2.2.1(cfd48f3)
 
 #include "glue.h"
 #include "uprint.h"
@@ -207,9 +208,9 @@ struct pbuf_wrapper
 	struct pbuf_wrapper* next;	// chain of unused
 };
 
-struct pbuf_wrapper* pbuf_wrapper_head = NULL;	// first free
+static struct pbuf_wrapper* pbuf_wrapper_head = NULL;	// first free
 
-struct pbuf_wrapper* pbuf_wrapper_get (void)
+static struct pbuf_wrapper* pbuf_wrapper_get (void)
 {
 	ets_intr_lock();
 
@@ -254,16 +255,23 @@ static void pbuf_wrapper_release (struct pbuf_wrapper* p)
 err_glue_t glue2esp_linkoutput (int netif_idx, void* ref2save, void* data, size_t size)
 {
 	struct netif* netif = netif_esp[netif_idx];
+
 	if (!netif)
 	{
-		uprint(DBG "glue2esp_linkoutput: if %d not initialized\n", netif_idx);
+		uprint(DBG "linkoutput: netif %d not initialized\n", netif_idx);
+		return GLUE_ERR_IF;
+	}
+
+	if (!(netif->flags & NETIF_FLAG_LINK_UP))
+	{
+		uprint(DBG "linkoutput(netif %d): link is not up\n", netif_idx);
 		return GLUE_ERR_IF;
 	}
 
 	struct pbuf_wrapper* p = pbuf_wrapper_get();
 	if (!p)
 	{
-		uprint(DBG "glue2esp_linkoutput(if %d): memory full\n", netif_idx);
+		uprint(DBG "linkoutput(netif %d): memory full\n", netif_idx);
 		return GLUE_ERR_MEM;
 	}
 
@@ -277,7 +285,7 @@ err_glue_t glue2esp_linkoutput (int netif_idx, void* ref2save, void* data, size_
 	p->pbuf.ref = 0;
 	p->ref2save = ref2save;
 
-	uprint(DBG "LINKOUTPUT: real pbuf sent to wilderness (len=%dB esp-pbuf=%p glue-pbuf=%p payload=%p netifidx=%d)\n",
+	uprint(DBG "linkoutput: real pbuf sent to wilderness (len=%dB esp-pbuf=%p glue-pbuf=%p payload=%p netif=%d)\n",
 		p->pbuf.len,
 		&p->pbuf,
 		ref2save,
@@ -289,11 +297,15 @@ err_glue_t glue2esp_linkoutput (int netif_idx, void* ref2save, void* data, size_
 	// we will retrieve our ref2save and give it back to glue
 
 	err_t err = netif->linkoutput(netif, &p->pbuf);
+
+	if (phy_capture)
+		phy_capture(netif->num, p->pbuf.payload, p->pbuf.len, /*out*/1, /*success*/err == ERR_OK);
+
 	if (err != ERR_OK)
 	{
 		// blob/phy is exhausted, release memory
 		pbuf_wrapper_release(p);
-		uprint(DBG "glue2esp_linkoutput: error %d\n", (int)err);
+		uprint(DBG "wifi-output: error %d\n", (int)err);
 	}
 	return esp2glue_err(err);
 }
@@ -310,7 +322,7 @@ void lwip_init (void)
 err_t etharp_output (struct netif* netif, struct pbuf* q, ip_addr_t* ipaddr)
 {
 	(void)netif; (void)q; (void)ipaddr;
-	uerror("ERROR: STUB etharp_output should not be called\n");
+	//uerror("ERROR: STUB etharp_output should not be called\n");
 	return ERR_ABRT;
 }
                    
@@ -329,7 +341,6 @@ err_t ethernet_input (struct pbuf* p, struct netif* netif)
 		dump("ethinput", p->payload, p->len);
 	}
 #endif
-
 	// copy esp pbuf to glue pbuf
 
 	void* glue_pbuf;
@@ -337,6 +348,9 @@ err_t ethernet_input (struct pbuf* p, struct netif* netif)
 
 	// ask glue for space to store payload into
 	esp2glue_alloc_for_recv(p->len, &glue_pbuf, &glue_data);
+
+	if (phy_capture)
+		phy_capture(netif->num, p->payload, p->len, /*out*/0, /*success*/!!glue_pbuf);
 
 	if (glue_pbuf)
 	{
@@ -384,6 +398,7 @@ void dhcp_cleanup (struct netif* netif)
 {
 	// not implemented yet
 	(void)netif;
+	// message yet unseen
 	STUB(dhcp_cleanup);
 }
 
@@ -391,6 +406,7 @@ err_t dhcp_release (struct netif* netif)
 {
 	// not implemented yet
 	(void)netif;
+	// message yet unseen
 	STUB(dhcp_release);
 	return ERR_ABRT;
 }
@@ -400,14 +416,15 @@ err_t dhcp_start (struct netif* netif)
 	uprint(DBG "dhcp_start ");
 	stub_display_netif(netif);
 
-	return glue2esp_err(esp2glue_dhcp_start(netif->num));
+	// for lwip-v2: NETIF_FLAG_LINK_UP is mandatory for both input and output
+	netif->flags |= NETIF_FLAG_LINK_UP;
+	err_t err = glue2esp_err(esp2glue_dhcp_start(netif->num));
+	return err;
 }
 
 void dhcp_stop (struct netif* netif)
 {
-	(void)netif;
-	// not implemented yet
-	STUB(dhcp_stop);
+	esp2glue_dhcp_stop(netif->num);
 }
 
 static int netif_is_new (struct netif* netif)
@@ -485,6 +502,7 @@ struct netif* netif_add (
 	netif->state = state;
 
 	uassert(packet_incoming == ethernet_input);
+	(void)packet_incoming;
 	netif->input = ethernet_input;
 
 		#if LWIP_NETIF_HWADDRHINT
@@ -505,7 +523,6 @@ struct netif* netif_add (
 	}
 
 	uprint(DBG "netif_add(ip:%x) -> ", (int)ipaddr->addr);
-	netif->flags |= NETIF_FLAG_LINK_UP; // !!!!! mandatory !!!!! (enable reception)
 	netif_set_addr(netif, ipaddr, netmask, gw);
 
 	return netif;
@@ -513,14 +530,8 @@ struct netif* netif_add (
 
 void netif_remove (struct netif* netif)
 {
-	(void)netif;
-	uprint(DBG "trying to remove netif ");
-	stub_display_netif(netif);
-	
-	// don't, see netif_set_down()
-	//esp2glue_netif_set_updown(netif->num, 0);
-	//netif->flags &= ~NETIF_FLAG_LINK_UP;
-	(void)netif;
+	uprint(DBG "netif_remove -> netif_set_down");
+	netif_set_down(netif);
 }
 
 static err_t voidinit (struct netif* netif)
@@ -557,10 +568,20 @@ void netif_set_addr (struct netif* netif, ip_addr_t* ipaddr, ip_addr_t* netmask,
 		set.gw.addr = gw->addr;
 		wifi_set_ip_info(netif->num, &set);
 	}
+	if (ipaddr->addr)
+		netif->flags |= NETIF_FLAG_LINK_UP; // mandatory (enable reception)
+	else
+		netif->flags &= ~NETIF_FLAG_LINK_UP;
 
 	stub_display_netif(netif);
 	
-	esp2glue_netif_update(netif->num, ipaddr->addr, netmask->addr, gw->addr, netif->hwaddr_len, netif->hwaddr, netif->mtu, netif->hostname);
+	// esp2glue_netif_update calls
+	//	=> lwip2 netif_set_addr()
+	//	=> lwip2 netif->status_callback()
+	//	=> lwip2 netif_sta_status_callback()
+	//	=> esp   glue2esp_ifup()
+	//	=> blobs's system_station_got_ip_set()
+	esp2glue_netif_update(netif->num, ipaddr->addr, netmask->addr, gw->addr, netif->hwaddr_len, netif->hwaddr, netif->mtu);
 }
 
 void netif_set_default (struct netif* netif)
@@ -575,16 +596,22 @@ void netif_set_down (struct netif* netif)
 	uprint(DBG "netif_set_down  ");
 	stub_display_netif(netif);
 	
+	// this is an old comment and may be wrong
+	// because since then netif handling has improved alot
+	// (keeping it for now)
+	//
 	// dont set down. some esp8266 will:
 	// * esp2glue_netif_set_down(sta)
 	// * restart dhcp-client _without_ netif_set_up.
 	// or:
 	// * esp2glue_netif_set_down(ap)
 	// * restart dhcp-server _without_ netif_set_up.
-	
-	// netif->flags &= ~(NETIF_FLAG_UP |  NETIF_FLAG_LINK_UP);
-	// esp2glue_netif_set_updown(netif->num, 0);
-	(void)netif;
+
+	netif->flags &= ~(NETIF_FLAG_UP | NETIF_FLAG_LINK_UP);
+	esp2glue_netif_set_up1down0(netif->num, 0);
+
+	// this seems sufficient
+	//netif_disable(netif);
 }
 
 void netif_set_up (struct netif* netif)
@@ -689,7 +716,8 @@ u8_t pbuf_free (struct pbuf *p)
 		return 1;
 	}
 
-	uerror("BAD CASE %p ref=%d tot_len=%d eb=%p\n", p, p->ref, p->tot_len, p->eb);
+	// never seen from the beginning (~1.5y), uerror => uprint, saves flash
+	uprint("BAD CASE %p ref=%d tot_len=%d eb=%p\n", p, p->ref, p->tot_len, p->eb);
 	return 0;
 }
 
@@ -702,32 +730,47 @@ void pbuf_ref (struct pbuf *p)
 void sys_timeout (u32_t msecs, sys_timeout_handler handler, void *arg)
 {
 	(void)msecs; (void)handler; (void)arg;
+	// yet never seen
 	STUB(sys_timeout);
 }
 
 void sys_untimeout (sys_timeout_handler handler, void *arg)
 {
 	(void)handler; (void)arg;
+	// yet never seen
 	STUB(sys_untimeout);
 }
 
-void glue2esp_ifup (int netif_idx, uint32_t ip, uint32_t mask, uint32_t gw)
+void glue2esp_ifupdown (int netif_idx, uint32_t ip, uint32_t mask, uint32_t gw)
 {
 	struct netif* netif = netif_esp[netif_idx];
 
-	// backup old esp ips
+	// backup old esp IPs
 	ip_addr_t oldip, oldmask, oldgw;
 	oldip = netif->ip_addr;
 	oldmask = netif->netmask;
 	oldgw = netif->gw;
 	        
-	// change ips
+	uprint(DBG "glue2esp_ifupdown new %d.%d.%d.%d old %ld.%ld.%ld.%ld\n",
+		        ip & 0xff,         (ip >> 8) & 0xff,         (ip >> 16) & 0xff,         ip >> 24,
+		oldip.addr & 0xff, (oldip.addr >> 8) & 0xff, (oldip.addr >> 16) & 0xff, oldip.addr >> 24);
+
+	// change IPs
 	netif->ip_addr.addr = ip;
 	netif->netmask.addr = mask;
 	netif->gw.addr = gw;
-	// set up
-	netif->flags |= NETIF_FLAG_UP;
 
-	// tell esp to check it has changed (by giving old ones)
-	system_station_got_ip_set(&oldip, &oldmask, &oldgw);
+	if (ip)
+	{
+		// set up
+		netif->flags |= NETIF_FLAG_UP;
+		// tell esp to check IP has changed (by giving old IPs)
+		// only in case ip!=0
+		system_station_got_ip_set(&oldip, &oldmask, &oldgw);
+	}
+	else
+		// or down
+		netif->flags &= ~NETIF_FLAG_UP;
 }
+
+void (*phy_capture) (int netif_idx, const char* data, size_t len, int out, int success) = NULL;

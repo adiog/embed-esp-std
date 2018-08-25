@@ -112,8 +112,11 @@ int WiFiClient::connect(IPAddress ip, uint16_t port)
     ip_addr_t addr;
     addr.addr = ip;
 
-    if (_client)
+    if (_client) {
         stop();
+        _client->unref();
+        _client = nullptr;
+    }
 
     // if the default interface is down, tcp_connect exits early without
     // ever calling tcp_err
@@ -272,13 +275,12 @@ void WiFiClient::stop()
     if (!_client)
         return;
 
-    _client->unref();
-    _client = 0;
+    _client->close();
 }
 
 uint8_t WiFiClient::connected()
 {
-    if (!_client)
+    if (!_client || _client->state() == CLOSED)
         return 0;
 
     return _client->state() == ESTABLISHED || available();
@@ -291,9 +293,9 @@ uint8_t WiFiClient::status()
     return _client->state();
 }
 
- WiFiClient::operator bool()
+WiFiClient::operator bool()
 {
-    return _client != 0;
+    return connected();
 }
 
 IPAddress WiFiClient::remoteIP()
@@ -343,4 +345,30 @@ void WiFiClient::stopAllExcept(WiFiClient* except)
             it->stop();
         }
     }
+}
+
+
+void WiFiClient::keepAlive (uint16_t idle_sec, uint16_t intv_sec, uint8_t count)
+{
+    _client->keepAlive(idle_sec, intv_sec, count);
+}
+
+bool WiFiClient::isKeepAliveEnabled () const
+{
+    return _client->isKeepAliveEnabled();
+}
+
+uint16_t WiFiClient::getKeepAliveIdle () const
+{
+    return _client->getKeepAliveIdle();
+}
+
+uint16_t WiFiClient::getKeepAliveInterval () const
+{
+    return _client->getKeepAliveInterval();
+}
+
+uint8_t WiFiClient::getKeepAliveCount () const
+{
+    return _client->getKeepAliveCount();
 }

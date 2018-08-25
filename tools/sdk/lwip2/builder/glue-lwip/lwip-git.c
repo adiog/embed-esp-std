@@ -163,12 +163,31 @@ err_glue_t esp2glue_dhcp_start (int netif_idx)
 {
 	uprint(DBG "dhcp_start netif: ");
 	new_display_netif(&netif_git[netif_idx]);
+
+	// set link and interface up for dhcp client
 	netif_set_link_up(&netif_git[netif_idx]);
-	//netif_set_up(&netif_git[netif_idx]); // unwanted call to netif_sta_status_callback()
-	netif_git[netif_idx].flags |= NETIF_FLAG_UP;
+	// calls netif_sta_status_callback() - if applicable (STA)
+	netif_set_up(&netif_git[netif_idx]);
+
+	// Update to latest esp hostname before starting dhcp client,
+	// 	because this name is provided to the dhcp server.
+	// Until proven wrong, dhcp client is the only code
+	// 	needing netif->hostname.
+	// Then obviously user application needs to set hostname
+	// 	before starting wifi station if dhcp is used.
+	// XXX to check: is wifi_station_get_hostname()
+	// 	returning a const pointer once _set_hostname is called?
+	netif_git[netif_idx].hostname = wifi_station_get_hostname();
+
 	err_t err = dhcp_start(&netif_git[netif_idx]);
 	uprint(DBG "new_dhcp_start returns %d\n", (int)err);
 	return git2glue_err(err);
+}
+
+void esp2glue_dhcp_stop (int netif_idx)
+{
+	uprint(DBG "dhcp_stop\n");
+	dhcp_stop(&netif_git[netif_idx]);
 }
 
 // pbuf_clone() needed and not yet defined in lwip2 sources
@@ -258,7 +277,8 @@ static err_t new_input (struct pbuf *p, struct netif *inp)
 {
 	(void)p;
 	(void)inp;
-	uerror("internal error, new-netif->input() cannot be called\n");
+	//uerror("internal error, new-netif->input() cannot be called\n");
+	uassert(0);
 	return ERR_ABRT;
 }
 
@@ -278,25 +298,25 @@ void esp2glue_netif_set_default (int netif_idx)
 
 static void netif_sta_status_callback (struct netif* netif)
 {
-	uprint(DBG "netif status callback ");
+	// address can be set or reset/any (=0)
+
+	uprint(DBG "netif status callback:\n");
 	new_display_netif(netif);
 	
-	if (netif->flags & NETIF_FLAG_LINK_UP)
-	{
-		// tell ESP that link is up
-		glue2esp_ifup(netif->num, netif->ip_addr.addr, netif->netmask.addr, netif->gw.addr);
+	// tell ESP that link is updated
+	glue2esp_ifupdown(netif->num, netif->ip_addr.addr, netif->netmask.addr, netif->gw.addr);
 
-		if (netif == netif_sta)
-		{
-			// this is our default route
-			netif_set_default(netif);
+	if (   netif->flags & NETIF_FLAG_UP
+	    && netif == netif_sta)
+	{
+		// this is our default route
+		netif_set_default(netif);
 			
-			if (netif->ip_addr.addr)
-			{
-				// restart sntp
-				sntp_stop();
-				sntp_init();
-			}
+		if (netif->ip_addr.addr)
+		{
+			// restart sntp
+			sntp_stop();
+			sntp_init();
 		}
 	}
 }
@@ -341,7 +361,7 @@ static err_t netif_init_ap (struct netif* netif)
 	return ERR_OK;
 }
 
-void esp2glue_netif_update (int netif_idx, uint32_t ip, uint32_t mask, uint32_t gw, size_t hwlen, const uint8_t* hwaddr, uint16_t mtu, const char* hostname)
+void esp2glue_netif_update (int netif_idx, uint32_t ip, uint32_t mask, uint32_t gw, size_t hwlen, const uint8_t* hwaddr, uint16_t mtu)
 {
 	uprint(DBG "netif updated:\n");
 
@@ -353,8 +373,21 @@ void esp2glue_netif_update (int netif_idx, uint32_t ip, uint32_t mask, uint32_t 
 		memcpy(netif->hwaddr, hwaddr, netif->hwaddr_len = hwlen);
 	}
 	
+	// properly set netif state according to IP address
+	// (we could pass netif flags though)
+	// so we don't later tell esp that we are up with a bad(=0) IP address
+	// (fixes sdk-2.2.1 disconnection/reconnection bug)
+	// TODO: now interface management is working quite better than in old
+	// XXX   times on esp-side, take time and properly propagate netif's
+	// XXX   (UP, LINK_UP) states into here
+	netif->flags |= NETIF_FLAG_LINK_UP;
+	if (ip)
+		netif->flags |= NETIF_FLAG_UP;
+	else
+		netif->flags &= ~NETIF_FLAG_UP;
+
 	netif->mtu = mtu;
-	netif->hostname = hostname;
+	netif->hostname = wifi_station_get_hostname();
 	ip4_addr_t aip = { ip }, amask = { mask }, agw = { gw };
 	netif_set_addr(&netif_git[netif_idx], &aip, &amask, &agw);
 	esp2glue_netif_set_up1down0(netif_idx, 1);
@@ -423,8 +456,16 @@ void esp2glue_netif_set_up1down0 (int netif_idx, int up1_or_down0)
 	}
 	else
 	{
+		// need to do this and pass it to esp
+		// (through netif_sta_status_callback())
+		// to update users's view of state
+		memset(&netif->ip_addr, 0, sizeof(netif->ip_addr));
+		memset(&netif->netmask, 0, sizeof(netif->netmask));
+		memset(&netif->gw, 0, sizeof(netif->gw));
+
 		netif_set_link_down(netif);
 		netif_set_down(netif);
+
 		if (netif_default == &netif_git[netif_idx])
 			netif_set_default(NULL);
 	}
@@ -433,3 +474,13 @@ void esp2glue_netif_set_up1down0 (int netif_idx, int up1_or_down0)
 #define VALUE_TO_STRING(x) #x
 #define VAR_NAME_VALUE(var) "\n\n-------- " #var " = "  VALUE_TO_STRING(var) " --------\n"
 #pragma message VAR_NAME_VALUE(TCP_MSS)
+
+LWIP_ERR_T lwip_unhandled_packet (struct pbuf* pbuf, struct netif* netif)
+{
+	// must pbuf_free(pbuf) if packet recognized and managed then return ERR_OK
+	// default: not recognized
+	// this function may be redefined by user
+	(void)pbuf;
+	(void)netif;
+	return ERR_ARG;
+}
